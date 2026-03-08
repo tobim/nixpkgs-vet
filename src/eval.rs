@@ -81,6 +81,8 @@ pub enum AttributeVariant {
     AttributeSet {
         /// Whether the attribute is a derivation (`lib.isDerivation`)
         is_derivation: bool,
+        /// Whether the attribute evaluates with `__structuredAttrs = true`.
+        structured_attrs: bool,
         /// The type of `callPackage` used.
         definition_variant: DefinitionVariant,
     },
@@ -298,6 +300,7 @@ fn by_name(
             attribute_variant:
                 AttributeVariant::AttributeSet {
                     is_derivation,
+                    structured_attrs,
                     definition_variant,
                 },
             location,
@@ -373,18 +376,26 @@ fn by_name(
 
             // Independently report problems about whether it's a derivation and the callPackage
             // variant.
-            is_derivation_result.and_(variant_result)
+            is_derivation_result
+                .and_(variant_result)
+                .map(|manual_definition| ratchet::Package {
+                    manual_definition,
+                    uses_by_name: Tight,
+                    structured_attrs: enabled_attribute_ratchet(
+                        structured_attrs,
+                        structure::relative_file_for_package(attribute_name),
+                    ),
+                })
         }
     };
-    Ok(
-        // Packages being checked in this function are _always_ already defined in `pkgs/by-name`,
-        // so instead of repeating ourselves all the time to define `uses_by_name`, just set it
-        // once at the end with a map.
-        manual_definition_result.map(|manual_definition| ratchet::Package {
-            manual_definition,
-            uses_by_name: Tight,
-        }),
-    )
+    Ok(manual_definition_result)
+}
+
+fn enabled_attribute_ratchet<R>(enabled: bool, file: RelativePathBuf) -> ratchet::RatchetState<R>
+where
+    R: ratchet::ToProblem<ToContext = RelativePathBuf>,
+{
+    if enabled { Tight } else { Loose(file) }
 }
 
 /// Handles the case for packages in `pkgs/by-name` that are manually overridden,
@@ -455,7 +466,7 @@ fn handle_non_by_name_attribute(
     use NonByNameAttribute::EvalSuccess;
     use ratchet::RatchetState::{Loose, NonApplicable, Tight};
 
-    let uses_by_name = match non_by_name_attribute {
+    let (uses_by_name, structured_attrs) = match non_by_name_attribute {
         // This is a big ol' match on various properties of the attribute
         //
         // First, it needs to succeed evaluation. We can't know whether an attribute could be
@@ -474,24 +485,12 @@ fn handle_non_by_name_attribute(
         // really justified.
         EvalSuccess(AttributeInfo {
             // We're only interested in attributes that are attribute sets, which all derivations
-            // are. Anything else can't be in `pkgs/by-name`.
+            // are. Anything else can't be in `pkgs/by-name`, and `__structuredAttrs` is only
+            // relevant for derivations.
             attribute_variant:
                 AttributeVariant::AttributeSet {
-                    // As of today, non-derivation attribute sets can't be in `pkgs/by-name`.
                     is_derivation: true,
-                    // Of the two definition variants, really only the manual one makes sense here.
-                    //
-                    // Special cases are:
-                    //
-                    // - Manual aliases to auto-called packages are not treated as manual
-                    //   definitions, due to limitations in the semantic `callPackage` detection.
-                    //   So those should be ignored.
-                    //
-                    // - Manual definitions using the internal `_internalCallByNamePackageFile`
-                    //   are not treated as manual definitions, since
-                    //   `_internalCallByNamePackageFile` is used to detect automatic ones. We
-                    //   can't distinguish from the above case, so we just need to ignore this one
-                    //   too, even if that internal attribute should never be called manually.
+                    structured_attrs,
                     definition_variant,
                 },
             location,
@@ -516,7 +515,7 @@ fn handle_non_by_name_attribute(
                 None
             };
 
-            if let (
+            let uses_by_name = if let (
                 DefinitionVariant::ManualDefinition {
                     is_semantic_call_package,
                 },
@@ -524,31 +523,47 @@ fn handle_non_by_name_attribute(
             ) = (definition_variant, parsed_definition.as_ref())
             {
                 match (is_semantic_call_package, optional_syntactic_call_package.as_ref()) {
-                    // Something like `<attr> = { }`
-                    (false, None)
-                    // Something like `<attr> = pythonPackages.callPackage ...`
-                    | (false, Some(_))
-                    // Something like `<attr> = bar` where `bar = pkgs.callPackage ...`
-                    | (true, None) => NonApplicable,
-                    // Something like `<attr> = pkgs.callPackage ...`
-                    (true, Some(syntactic_call_package)) => {
-                        match syntactic_call_package.relative_path {
-                            Some(ref rel_path) if rel_path.starts_with(BASE_SUBPATH) => {
-                                // Package variants already point at `pkgs/by-name`, so they are
-                                // not candidates for this ratchet.
-                                NonApplicable
+                        // Something like `<attr> = { }`
+                        (false, None)
+                        // Something like `<attr> = pythonPackages.callPackage ...`
+                        | (false, Some(_))
+                        // Something like `<attr> = bar` where `bar = pkgs.callPackage ...`
+                        | (true, None) => NonApplicable,
+                        // Something like `<attr> = pkgs.callPackage ...`
+                        (true, Some(syntactic_call_package)) => {
+                            match syntactic_call_package.relative_path {
+                                Some(ref rel_path) if rel_path.starts_with(BASE_SUBPATH) => {
+                                    // Package variants already point at `pkgs/by-name`, so they
+                                    // are not candidates for this ratchet.
+                                    NonApplicable
+                                }
+                                _ => Loose((syntactic_call_package.clone(), location.file.clone())),
                             }
-                            _ => Loose((syntactic_call_package.clone(), location.file.clone())),
                         }
                     }
-                }
             } else {
                 NonApplicable
-            }
+            };
+
+            let evaluated_attribute_file =
+                parsed_definition
+                    .as_ref()
+                    .map(|(location, optional_syntactic_call_package)| {
+                        optional_syntactic_call_package
+                            .as_ref()
+                            .and_then(|call_package| call_package.relative_path.clone())
+                            .unwrap_or_else(|| location.file.clone())
+                    });
+
+            let structured_attrs = match (structured_attrs, evaluated_attribute_file) {
+                (true, _) => Tight,
+                (false, Some(file)) => Loose(file),
+                (false, None) => NonApplicable,
+            };
+
+            (uses_by_name, structured_attrs)
         }
-        // This catches all the cases not matched by the above `EvalSuccess`, falling back to not
-        // being able to migrate such attributes.
-        _ => NonApplicable,
+        _ => (NonApplicable, NonApplicable),
     };
     Ok(Success(ratchet::Package {
         // Packages being checked in this function _always_ need a manual definition, because
@@ -556,5 +571,6 @@ fn handle_non_by_name_attribute(
         // ourselves all the time to define `manual_definition`, just set it once at the end here.
         manual_definition: Tight,
         uses_by_name,
+        structured_attrs,
     }))
 }
