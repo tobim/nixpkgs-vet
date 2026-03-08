@@ -81,6 +81,8 @@ pub enum AttributeVariant {
     AttributeSet {
         /// Whether the attribute is a derivation (`lib.isDerivation`)
         is_derivation: bool,
+        /// Whether the attribute evaluates with `strictDeps = true`.
+        strict_deps: bool,
         /// Whether the attribute evaluates with `__structuredAttrs = true`.
         structured_attrs: bool,
         /// The type of `callPackage` used.
@@ -300,6 +302,7 @@ fn by_name(
             attribute_variant:
                 AttributeVariant::AttributeSet {
                     is_derivation,
+                    strict_deps,
                     structured_attrs,
                     definition_variant,
                 },
@@ -381,6 +384,10 @@ fn by_name(
                 .map(|manual_definition| ratchet::Package {
                     manual_definition,
                     uses_by_name: Tight,
+                    strict_deps: enabled_attribute_ratchet(
+                        strict_deps,
+                        structure::relative_file_for_package(attribute_name),
+                    ),
                     structured_attrs: enabled_attribute_ratchet(
                         structured_attrs,
                         structure::relative_file_for_package(attribute_name),
@@ -466,7 +473,7 @@ fn handle_non_by_name_attribute(
     use NonByNameAttribute::EvalSuccess;
     use ratchet::RatchetState::{Loose, NonApplicable, Tight};
 
-    let (uses_by_name, structured_attrs) = match non_by_name_attribute {
+    let (uses_by_name, strict_deps, structured_attrs) = match non_by_name_attribute {
         // This is a big ol' match on various properties of the attribute
         //
         // First, it needs to succeed evaluation. We can't know whether an attribute could be
@@ -485,11 +492,12 @@ fn handle_non_by_name_attribute(
         // really justified.
         EvalSuccess(AttributeInfo {
             // We're only interested in attributes that are attribute sets, which all derivations
-            // are. Anything else can't be in `pkgs/by-name`, and `__structuredAttrs` is only
-            // relevant for derivations.
+            // are. Anything else can't be in `pkgs/by-name`, and `strictDeps` is only relevant for
+            // derivations.
             attribute_variant:
                 AttributeVariant::AttributeSet {
                     is_derivation: true,
+                    strict_deps,
                     structured_attrs,
                     definition_variant,
                 },
@@ -555,15 +563,21 @@ fn handle_non_by_name_attribute(
                             .unwrap_or_else(|| location.file.clone())
                     });
 
+            let strict_deps = match (strict_deps, evaluated_attribute_file.clone()) {
+                (true, _) => Tight,
+                (false, Some(file)) => Loose(file),
+                (false, None) => NonApplicable,
+            };
+
             let structured_attrs = match (structured_attrs, evaluated_attribute_file) {
                 (true, _) => Tight,
                 (false, Some(file)) => Loose(file),
                 (false, None) => NonApplicable,
             };
 
-            (uses_by_name, structured_attrs)
+            (uses_by_name, strict_deps, structured_attrs)
         }
-        _ => (NonApplicable, NonApplicable),
+        _ => (NonApplicable, NonApplicable, NonApplicable),
     };
     Ok(Success(ratchet::Package {
         // Packages being checked in this function _always_ need a manual definition, because
@@ -571,6 +585,7 @@ fn handle_non_by_name_attribute(
         // ourselves all the time to define `manual_definition`, just set it once at the end here.
         manual_definition: Tight,
         uses_by_name,
+        strict_deps,
         structured_attrs,
     }))
 }
